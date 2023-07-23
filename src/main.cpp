@@ -4,12 +4,13 @@
 #include <Eigen/Core>
 #include <cmath>
 #include <iostream>
+#include <xsimd/xsimd.hpp>
 
 using namespace Eigen;
 
 namespace py = pybind11;
 
-const Eigen::Vector3d Zl = {0.0, 0.0, 1.0};
+const Vector3d Zl = {0.0, 0.0, 1.0};
 const double eps = std::numeric_limits<double>::epsilon();
 const double sqrtEps = std::sqrt(std::numeric_limits<double>::epsilon());
 
@@ -78,17 +79,17 @@ Array<bool, Dynamic, 1> validateAngleRanges(const VectorXd& angList, const Vecto
     return result;
 }
 
-Matrix3d makeEtaFrameRotMat(const Vector3d& b, const Vector3d& e) {
-    Vector3d yHat = e.cross(b).normalized();
-    Vector3d bHat = b.normalized();
-    Vector3d xHat = bHat.cross(yHat);
-    Matrix3d r;
-    r << xHat, yHat, -bHat;
+const static Matrix3d makeEtaFrameRotMat(const Vector3d& b, const Vector3d& e) noexcept {
+  const Vector3d yHat = e.cross(b).normalized();
+  const Vector3d bHat = b.normalized();
+  const Vector3d xHat = bHat.cross(yHat);
+  Matrix3d r;
+  r << xHat, yHat, -bHat;
 
-    return r;
+  return r;
 }
 
-MatrixXd makeBinaryRotMat(const Vector3d& a) {
+const static MatrixXd makeBinaryRotMat(const Vector3d& a) {
     Matrix3d r = 2.0 * a * a.transpose();
     r.diagonal() -= Vector3d::Ones();
     return r;
@@ -99,7 +100,7 @@ MatrixXd makeRotMatOfExpMap(const Vector3d& e) {
     return rotation.toRotationMatrix();
 }
 
-MatrixXd makeOscillRotMat_internal(double chi, double ome) {
+const static MatrixXd makeOscillRotMat_internal(double chi, double ome) {
   Matrix3d r;
   r = AngleAxisd(chi, Vector3d::UnitX())
     * AngleAxisd(ome, Vector3d::UnitY());
@@ -107,51 +108,96 @@ MatrixXd makeOscillRotMat_internal(double chi, double ome) {
   return r;
 }
 
-MatrixXd makeOscillRotMat(double chi, VectorXd ome) {
-  MatrixXd rots(3 * ome.size(), 3);
-  for (int i = 0; i < ome.size(); ++i) {
-    rots.block<3,3>(3*i,0) = makeOscillRotMat_internal(chi, ome(i));
+static MatrixX3d makeOscillRotMat(double chi, const VectorXd& ome) {
+  MatrixX3d rots(3 * ome.size(), 3);
+  const double cchi = cos(chi), schi = sin(chi);
+  xsimd::batch<double, 2UL> come_v, some_v;
+
+  const size_t batch_size = xsimd::simd_traits<double>::size;
+  const size_t vec_size = ome.size();
+
+  for (size_t i = 0; i < vec_size; i += batch_size) {
+    auto ome_v = xsimd::load_unaligned<double>(&ome[i]);
+    come_v = xsimd::cos(ome_v);
+    some_v = xsimd::sin(ome_v);
+
+    for(size_t j = 0; j < batch_size && (i+j) < vec_size; ++j) {
+      rots.block<3, 3>(3*(i+j), 0) <<         come_v[j],    0,         some_v[j],
+                                       schi * some_v[j], cchi, -schi * come_v[j],
+                                      -cchi * some_v[j], schi,  cchi * come_v[j];
+    }
   }
   return rots;
 }
 
-MatrixXd unitRowVectors(const MatrixXd& cIn) {
+const static MatrixXd makeOscillRotMatSingle(double chi, double ome) {
+  return makeOscillRotMat_internal(chi, ome);
+}
+
+const static MatrixXd unitRowVectors(const MatrixXd& cIn) {
   return cIn.rowwise().normalized();
 }
 
-VectorXd unitRowVector(const VectorXd& cIn) {
+const static VectorXd unitRowVector(const VectorXd& cIn) {
   return cIn.normalized();
 }
 
-MatrixXd anglesToGvec(MatrixXd& angs, Vector3d& bHat_l, Vector3d& eHat_l, double chi, Matrix3d& rMat_c) {
-    // Construct matrix where each row represents a gVec_l calculated for each angle
-    MatrixXd cosHalfAngs = (0.5 * angs.col(0)).array().cos();
-    MatrixXd sinHalfAngs = (0.5 * angs.col(0)).array().sin();
-    MatrixXd cosAngs1 = angs.col(1).array().cos();
-    MatrixXd sinAngs1 = angs.col(1).array().sin();
+////////////////////////////////////////
+
+MatrixXd anglesToGvecModified(const MatrixXd& angs, const Vector3d& bHat_l, const Vector3d& eHat_l, double chi, const Matrix3d& rMat_c) noexcept {
+    MatrixXd angs_mod;
+    if (angs.cols() == 2) {
+        angs_mod = MatrixXd::Zero(angs.rows(), 3);
+        angs_mod.block(0, 0, angs.rows(), 2) = angs;
+    } else {
+        angs_mod = angs;
+    }
+    const VectorXd cosHalfAngs = (0.5 * angs.col(0)).array().cos();
+    const VectorXd sinHalfAngs = (0.5 * angs.col(0)).array().sin();
+    const VectorXd cosAngs1 = angs.col(1).array().cos();
+    const VectorXd sinAngs1 = angs.col(1).array().sin();
     MatrixXd gVec_l(angs.rows(), 3);
     gVec_l << cosHalfAngs.cwiseProduct(cosAngs1), cosHalfAngs.cwiseProduct(sinAngs1), sinHalfAngs;
 
-    // Make eta frame cob matrix and transform gVec_l to lab frame
-    Matrix3d rMat_e = makeEtaFrameRotMat(bHat_l, eHat_l);
-    gVec_l = (rMat_e * gVec_l.transpose()).transpose();
-
-    // Calculate rotation matrices for each pair of angles chi and ome
-    std::vector<Matrix3d> rotation_matrices;
-    for (int i = 0; i < angs.rows(); i++) {
-        rotation_matrices.push_back(makeOscillRotMat_internal(chi, angs(i, 2)));
-    }
-
-    // Multiply rotation matrices by rMat_c
-    std::vector<Matrix3d> result_matrices;
-    for (auto &rotMat_s : rotation_matrices) {
-        result_matrices.push_back(rMat_c.transpose() * rotMat_s.transpose());
-    }
-
-    // Compute the dot product of result_matrices and gVec_l
+    // Transform gVec_l to lab frame
+    gVec_l = (makeEtaFrameRotMat(bHat_l, eHat_l) * gVec_l.transpose());
     MatrixXd gVec_c(angs.rows(), 3);
+
+    const Matrix3d rMat_c_T = rMat_c.transpose();
+    const Matrix3d A = AngleAxisd(chi, Vector3d::UnitX()).matrix();
+
     for (int i = 0; i < angs.rows(); i++) {
-        gVec_c.row(i) = (result_matrices[i] * gVec_l.row(i).transpose()).transpose();
+        gVec_c.row(i).noalias() = rMat_c_T * (A * AngleAxisd(angs(i, 2), Vector3d::UnitY())).matrix().transpose() * gVec_l.col(i);
+    }
+
+    return gVec_c;
+}
+
+MatrixXd anglesToGvecModified_atomic(const MatrixXd& angs, double chi, const Matrix3d& rMat_c) noexcept {
+    Vector3d bHat_l(0, 0, -1); // default for beam_vec
+    Vector3d eHat_l(1, 0, 0); // default for eta_vec
+    return anglesToGvecModified(angs, bHat_l, eHat_l, chi, rMat_c);
+}
+
+////////////////////////////////////////
+
+MatrixXd anglesToGvec(const MatrixXd& angs, const Vector3d& bHat_l, const Vector3d& eHat_l, double chi, const Matrix3d& rMat_c) noexcept {
+    const VectorXd cosHalfAngs = (0.5 * angs.col(0)).array().cos();
+    const VectorXd sinHalfAngs = (0.5 * angs.col(0)).array().sin();
+    const VectorXd cosAngs1 = angs.col(1).array().cos();
+    const VectorXd sinAngs1 = angs.col(1).array().sin();
+    MatrixXd gVec_l(angs.rows(), 3);
+    gVec_l << cosHalfAngs.cwiseProduct(cosAngs1), cosHalfAngs.cwiseProduct(sinAngs1), sinHalfAngs;
+
+    // Transform gVec_l to lab frame
+    gVec_l = (makeEtaFrameRotMat(bHat_l, eHat_l) * gVec_l.transpose());
+    MatrixXd gVec_c(angs.rows(), 3);
+
+    const Matrix3d rMat_c_T = rMat_c.transpose();
+    const Matrix3d A = AngleAxisd(chi, Vector3d::UnitX()).matrix();
+
+    for (int i = 0; i < angs.rows(); i++) {
+        gVec_c.row(i).noalias() = rMat_c_T * (A * AngleAxisd(angs(i, 2), Vector3d::UnitY())).matrix().transpose() * gVec_l.col(i);
     }
 
     return gVec_c;
@@ -191,24 +237,24 @@ MatrixXd anglesToDvec(MatrixXd& angs, Vector3d& bHat_l, Vector3d& eHat_l, double
     return gVec_c;
 }
 
-Eigen::Vector2d gvecToDetectorXYOne(const Eigen::Vector3d& gVec_c, const Eigen::Matrix3d& rMat_d,
-                                    const Eigen::Matrix3d& rMat_sc, const Eigen::Vector3d& tVec_d,
-                                    const Eigen::Vector3d& bHat_l, const Eigen::Vector3d& nVec_l,
-                                    double num, const Eigen::Vector3d& P0_l)
+const static Vector2d gvecToDetectorXYOne(const Vector3d& gVec_c, const Matrix3d& rMat_d,
+                                    const Matrix3d& rMat_sc, const Vector3d& tVec_d,
+                                    const Vector3d& bHat_l, const Vector3d& nVec_l,
+                                    double num, const Vector3d& P0_l)
 {
-  Eigen::Vector3d gHat_c = gVec_c.normalized();
-  Eigen::Vector3d gVec_l = rMat_sc * gHat_c;
+  Vector3d gHat_c = gVec_c.normalized();
+  Vector3d gVec_l = rMat_sc * gHat_c;
   double bDot = -bHat_l.dot(gVec_l);
 
   if ( bDot >= eps && bDot <= 1.0 - eps ) {
-    Eigen::Matrix3d brMat = makeBinaryRotMat(gVec_l);
+    Matrix3d brMat = makeBinaryRotMat(gVec_l);
 
-    Eigen::Vector3d dVec_l = -brMat * bHat_l;
+    Vector3d dVec_l = -brMat * bHat_l;
     double denom = nVec_l.dot(dVec_l);
 
     if ( denom < -eps ) {
-      Eigen::Vector3d P2_l = P0_l + dVec_l * num / denom;
-      Eigen::Vector2d result;
+      Vector3d P2_l = P0_l + dVec_l * num / denom;
+      Vector2d result;
       result[0] = (rMat_d.col(0).dot(P2_l - tVec_d));
       result[1] = (rMat_d.col(1).dot(P2_l - tVec_d));
 
@@ -216,27 +262,27 @@ Eigen::Vector2d gvecToDetectorXYOne(const Eigen::Vector3d& gVec_c, const Eigen::
     }
   }
 
-  return Eigen::Vector2d(NAN, NAN);
+  return Vector2d(NAN, NAN);
 }
 
-Eigen::MatrixXd gvecToDetectorXY(const Eigen::MatrixXd& gVec_c, const Eigen::Matrix3d& rMat_d,
-                                 const Eigen::MatrixXd& rMat_s, const Eigen::Matrix3d& rMat_c,
-                                 const Eigen::Vector3d& tVec_d, const Eigen::Vector3d& tVec_s,
-                                 const Eigen::Vector3d& tVec_c, const Eigen::Vector3d& beamVec)
+const static MatrixXd gvecToDetectorXY(const MatrixXd& gVec_c, const Matrix3d& rMat_d,
+                                 const MatrixXd& rMat_s, const Matrix3d& rMat_c,
+                                 const Vector3d& tVec_d, const Vector3d& tVec_s,
+                                 const Vector3d& tVec_c, const Vector3d& beamVec)
 {
     int npts = gVec_c.rows();
-    Eigen::MatrixXd result(npts, 2);
+    MatrixXd result(npts, 2);
 
-    Eigen::Vector3d bHat_l = beamVec.normalized();
+    Vector3d bHat_l = beamVec.normalized();
 
     for (int i=0; i<npts; i++) {
-        Eigen::Vector3d nVec_l = rMat_d * Zl;
-        Eigen::Vector3d P0_l = tVec_s + rMat_s.block<3,3>(i*3, 0) * tVec_c;
-        Eigen::Vector3d P3_l = tVec_d;
+        Vector3d nVec_l = rMat_d * Zl;
+        Vector3d P0_l = tVec_s + rMat_s.block<3,3>(i*3, 0) * tVec_c;
+        Vector3d P3_l = tVec_d;
 
         double num = nVec_l.dot(P3_l - P0_l);
 
-        Eigen::Matrix3d rMat_sc = rMat_s.block<3,3>(i*3, 0) * rMat_c;
+        Matrix3d rMat_sc = rMat_s.block<3,3>(i*3, 0) * rMat_c;
 
         result.row(i) = gvecToDetectorXYOne(gVec_c.row(i), rMat_d, rMat_sc, tVec_d,
                                             bHat_l, nVec_l, num, P0_l).transpose();
@@ -245,30 +291,23 @@ Eigen::MatrixXd gvecToDetectorXY(const Eigen::MatrixXd& gVec_c, const Eigen::Mat
     return result;
 }
 
-Eigen::MatrixXd gvecToDetectorXYArray(
-    const Eigen::MatrixXd& gVec,
-    const Eigen::Matrix3d& rMat_d, const Eigen::MatrixXd& rMat_s, const Eigen::Matrix3d& rMat_c,
-    const Eigen::Vector3d& tVec_d, const Eigen::Vector3d& tVec_s, const Eigen::Vector3d& tVec_c,
-    const Eigen::Vector3d& beamVec)
+const static MatrixXd gvecToDetectorXYArray(
+    const MatrixXd& gVec,
+    const Matrix3d& rMat_d, const MatrixXd& rMat_s, const Matrix3d& rMat_c,
+    const Vector3d& tVec_d, const Vector3d& tVec_s, const Vector3d& tVec_c,
+    const Vector3d& beamVec)
 {
-    Eigen::MatrixXd result(gVec.rows(), 2);
-    Eigen::Vector3d Zl(0, 0, 1);
-    Eigen::Vector3d bHat_l = beamVec.normalized();
+    MatrixXd result(gVec.rows(), 2);
+    Vector3d bHat_l = beamVec.normalized();
 
+    #pragma omp parallel for
     for (int i = 0; i < gVec.rows(); ++i) {
-        Eigen::Vector3d nVec_l = Eigen::Vector3d::Zero();
-        Eigen::Vector3d P0_l = tVec_s;
-        for (int j = 0; j < 3; ++j) {
-            nVec_l += rMat_d.col(j) * Zl[j];
-            P0_l += rMat_s.block<3, 3>(i * 3, 0).col(j) * tVec_c[j];
-        }
+        // Replaced loop with matrix-vector operations
+        Vector3d nVec_l = rMat_d * Zl;
+        Vector3d P0_l = tVec_s + rMat_s.block<3, 3>(i * 3, 0) * tVec_c;
 
-        Eigen::Vector3d P3_l = tVec_d;
-        double num = nVec_l.dot(P3_l - P0_l);
-
-        Eigen::Matrix3d rMat_sc = rMat_s.block<3, 3>(i * 3, 0) * rMat_c;
-
-        result.row(i) = gvecToDetectorXYOne(gVec.row(i), rMat_d, rMat_sc, tVec_d, bHat_l, nVec_l, num, P0_l);
+        result.row(i) = gvecToDetectorXYOne(gVec.row(i), rMat_d, rMat_s.block<3, 3>(i * 3, 0) * rMat_c,
+                                            tVec_d, bHat_l, nVec_l, nVec_l.dot(tVec_d - P0_l), P0_l);
     }
 
     return result;
@@ -469,7 +508,8 @@ PYBIND11_MODULE(example, m)
   m.def("make_eta_frame_rot_mat", &makeEtaFrameRotMat, "Function to compute rotation matrix");
   m.def("make_binary_rot_mat", &makeBinaryRotMat, "Function that computes a rotation matrix from a binary vector");
   m.def("make_rot_mat_of_exp_map", &makeRotMatOfExpMap, "Function that computes a rotation matrix from an exponential map");
-  m.def("makeOscillRotMat", &makeOscillRotMat, "Function that generates a rotation matrix from two angles (chi, ome)");
+  m.def("makeOscillRotMat", &makeOscillRotMat, "Function that generates a collection of rotation matrices from two angles (chi, ome)");
+  m.def("makeOscillRotMatSingle", &makeOscillRotMatSingle, "Function that generates a rotation matrix from two angles (chi, ome)");
   m.def("unit_row_vectors", &unitRowVectors, "Function that normalizes row vectors");
   m.def("unit_row_vector", &unitRowVector, "Function that normalizes a row vector");
   m.def("anglesToGVec", &anglesToGvec, "Function that converts angles to g-vectors");
@@ -480,4 +520,6 @@ PYBIND11_MODULE(example, m)
   m.def("detector_xy_to_gvec", &detectorXYToGvec, "Function that converts detector xy coordinates to g-vectors");
   m.def("detector_xy_to_gvec_one", &detectorXYToGVecOne, "Function that converts detector xy coordinates to g-vectors");
   m.def("oscill_angles_of_hkls", &oscillAnglesOfHKLs, "Function that computes oscillation angles of HKLs");
+  m.def("anglesToGVecModified", &anglesToGvecModified, "Function that converts angles to g-vectors with additional checks");
+  m.def("anglesToGVecModified_atomic", &anglesToGvecModified_atomic, "Function that converts angles to g-vectors with additional checks and defaults for eta_vec and beam_vec");
 }
