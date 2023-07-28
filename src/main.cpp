@@ -108,7 +108,7 @@ const static MatrixXf makeOscillRotMat_internal(float chi, float ome) {
   return r;
 }
 
-static MatrixX3f makeOscillRotMat(float chi, const VectorXf& ome) {
+static MatrixX3f makeOscillRotMat(const float chi, const VectorXf& ome) {
   MatrixX3f rots(3 * ome.size(), 3);
   const float cchi = cos(chi), schi = sin(chi);
   xsimd::batch<float, 4UL> come_v, some_v;
@@ -256,6 +256,31 @@ const static Vector2f gvecToDetectorXYOne(const Vector3f& gVec_c, const Matrix3f
 
   return Vector2f(NAN, NAN);
 }
+const static Vector2f gvecToDetectorXYOneSimple(const Vector3f& gVec_l, const Matrix3f& rMat_d,
+                                    const Vector3f& tVec_d,
+                                    const Vector3f& bHat_l, const Vector3f& nVec_l,
+                                    float num, const Vector3f& P0_l)
+{
+  float bDot = -bHat_l.dot(gVec_l);
+
+  if ( bDot >= eps && bDot <= 1.0 - eps ) {
+    Matrix3f brMat = makeBinaryRotMat(gVec_l);
+
+    Vector3f dVec_l = -brMat * bHat_l;
+    float denom = nVec_l.dot(dVec_l);
+
+    if ( denom < -eps ) {
+      Vector3f P2_l = P0_l + dVec_l * num / denom;
+      Vector2f result;
+      result[0] = (rMat_d.col(0).dot(P2_l - tVec_d));
+      result[1] = (rMat_d.col(1).dot(P2_l - tVec_d));
+
+      return result;
+    }
+  }
+
+  return Vector2f(NAN, NAN);
+}
 
 const static MatrixXf gvecToDetectorXY(const MatrixXf& gVec_c, const Matrix3f& rMat_d,
                                  const MatrixXf& rMat_s, const Matrix3f& rMat_c,
@@ -281,6 +306,62 @@ const static MatrixXf gvecToDetectorXY(const MatrixXf& gVec_c, const Matrix3f& r
     }
 
     return result;
+}
+
+const static MatrixXf gvecToDetectorXYFromAngles(const float chi, const VectorXf omes,
+                                 const MatrixXf& gVec_c, const Matrix3f& rMat_d,
+                                 const Matrix3f& rMat_c,
+                                 const Vector3f& tVec_d, const Vector3f& tVec_s,
+                                 const Vector3f& tVec_c, const Vector3f& beamVec)
+{
+    int npts = gVec_c.rows();
+    MatrixXf result(npts, 2);
+    MatrixX3f rMat_s = makeOscillRotMat(chi, omes);
+
+    Vector3f bHat_l = beamVec.normalized();
+
+    for (int i=0; i<npts; i++) {
+        Vector3f nVec_l = rMat_d * Zl;
+        Vector3f P0_l = tVec_s + rMat_s.block<3,3>(i*3, 0) * tVec_c;
+        Vector3f P3_l = tVec_d;
+
+        float num = nVec_l.dot(P3_l - P0_l);
+
+        Matrix3f rMat_sc = rMat_s.block<3,3>(i*3, 0) * rMat_c;
+
+        result.row(i) = gvecToDetectorXYOne(gVec_c.row(i), rMat_d, rMat_sc, tVec_d,
+                                            bHat_l, nVec_l, num, P0_l).transpose();
+    }
+
+    return result;
+}
+
+const static MatrixX2f anglesToGvecToDetectorXYFromAngles(const float chi, const MatrixXf omes,
+                                 const Matrix3f& rMat_d, const Matrix3f& rMat_c,
+                                 const Vector3f& tVec_d, const Vector3f& tVec_s,
+                                 const Vector3f& tVec_c, const Vector3f& beamVec)
+{
+  MatrixX2f result(omes.rows(), 2);
+  MatrixX3f rMat_s = makeOscillRotMat(chi, omes.col(2));
+  MatrixX3f gVec_c = anglesToGvec(omes, beamVec, {1, 0, 0}, chi, rMat_c).rowwise().normalized();
+  Vector3f bHat_l = beamVec.normalized();
+
+  #pragma omp parallel for
+  for (int i=0; i<omes.rows(); i++) {
+    Matrix3f current_rmat = rMat_s.block<3,3>(i*3, 0);
+    Vector3f nVec_l = rMat_d * Zl;
+    Vector3f P0_l = tVec_s + current_rmat * tVec_c;
+
+    float num = nVec_l.dot(tVec_d - P0_l);
+
+    Vector3f norm = gVec_c.row(i);
+    Vector3f gVec_l = current_rmat * rMat_c * norm;
+
+    result.row(i) = gvecToDetectorXYOneSimple(gVec_l, rMat_d, tVec_d,
+                                              bHat_l, nVec_l, num, P0_l).transpose();
+  }
+
+  return result;
 }
 
 const static MatrixXf gvecToDetectorXYArray(
@@ -489,6 +570,18 @@ std::pair<MatrixXf, MatrixXf> oscillAnglesOfHKLs(
     return {oangs0, oangs1};
 }
 
+Eigen::ArrayXXd ge_41rt_inverse_distortion(const Eigen::ArrayXXd& inputs, const double rhoMax, const Eigen::ArrayXd& params) {
+    Eigen::ArrayXd radii = inputs.matrix().rowwise().norm();
+    Eigen::ArrayXd inverted_radii = radii.cwiseInverse();
+    Eigen::ArrayXd cosines = inputs.col(0) * inverted_radii;
+    Eigen::ArrayXd cosine_double_angles = 2*cosines.square() - 1;
+    Eigen::ArrayXd cosine_quadruple_angles = 2*cosine_double_angles.square() - 1;
+    Eigen::ArrayXd sqrt_p_is = rhoMax / (-params[0]*cosine_double_angles - params[1]*cosine_quadruple_angles - params[2]).sqrt();
+    Eigen::ArrayXd solutions = (2/sqrt(3))*sqrt_p_is*(acos((-3*sqrt(3)/2)*radii/sqrt_p_is)/3 + 4*M_PI/3).cos();
+    Eigen::ArrayXXd results = solutions.rowwise().replicate(inputs.cols()).array() * inputs * inverted_radii.rowwise().replicate(inputs.cols()).array();
+
+    return results;
+}
 
 PYBIND11_MODULE(example, m)
 {
@@ -502,6 +595,7 @@ PYBIND11_MODULE(example, m)
   m.def("make_rot_mat_of_exp_map", &makeRotMatOfExpMap, "Function that computes a rotation matrix from an exponential map");
   m.def("makeOscillRotMat", &makeOscillRotMat, "Function that generates a collection of rotation matrices from two angles (chi, ome)");
   m.def("makeOscillRotMatSingle", &makeOscillRotMatSingle, "Function that generates a rotation matrix from two angles (chi, ome)");
+  m.def("anglesToGvecToDetectorXYFromAngles", &anglesToGvecToDetectorXYFromAngles, "I hate this.");
   m.def("unit_row_vectors", &unitRowVectors, "Function that normalizes row vectors");
   m.def("unit_row_vector", &unitRowVector, "Function that normalizes a row vector");
   m.def("anglesToGVec", &anglesToGvec, "Function that converts angles to g-vectors");
@@ -509,7 +603,9 @@ PYBIND11_MODULE(example, m)
   m.def("gvec_to_detector_xy_one", &gvecToDetectorXYOne, "Function that converts g-vectors to detector xy coordinates");
   m.def("gvecToDetectorXY", &gvecToDetectorXY, "A function that converts gVec to detector XY");
   m.def("gvecToDetectorXYArray", &gvecToDetectorXYArray, "Function that converts g-vectors to detector xy coordinates");
+  m.def("gvecToDetectorXYFromAngles", &gvecToDetectorXYFromAngles, "Function that converts g-vectors to detector xy coordinates, given rotation axes");
   m.def("detector_xy_to_gvec", &detectorXYToGvec, "Function that converts detector xy coordinates to g-vectors");
   m.def("detector_xy_to_gvec_one", &detectorXYToGVecOne, "Function that converts detector xy coordinates to g-vectors");
   m.def("oscill_angles_of_hkls", &oscillAnglesOfHKLs, "Function that computes oscillation angles of HKLs");
+  m.def("ge_41rt_inverse_distortion", &ge_41rt_inverse_distortion, "Inverse distortion for ge_41rt");
 }
