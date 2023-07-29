@@ -142,54 +142,135 @@ const static VectorXf unitRowVector(const VectorXf& cIn) {
   return cIn.normalized();
 }
 
-const static MatrixXf anglesToGvec(const MatrixXf& angs, const Vector3f& bHat_l, const Vector3f& eHat_l, float chi, const Matrix3f& rMat_c) noexcept {
-  const size_t batch_size = xsimd::simd_traits<float>::size;
+const static MatrixX3f anglesToGvec(const MatrixXf &angs,
+                                    const Vector3f &bHat_l,
+                                    const Vector3f &eHat_l, float chi,
+                                    const Matrix3f &rMat_c) noexcept {
+  constexpr size_t batch_size = xsimd::simd_traits<float>::size;
   const size_t vec_size = angs.rows();
   const size_t num_full_batches = vec_size / batch_size;
 
-  const float cchi = cos(chi), schi = sin(chi);
-  MatrixXf gVec_l(angs.rows(), 3);
-  MatrixXf gVec_c(angs.rows(), 3);
+  auto cchi = cos(chi);
+  auto schi = sin(chi);
+  MatrixX3f gVec_c(angs.rows(), 3);
+
+  auto rotMat = makeEtaFrameRotMat(bHat_l, eHat_l);
+
+  auto rotMat00 = rotMat(0, 0);
+  auto rotMat01 = rotMat(0, 1);
+  auto rotMat02 = rotMat(0, 2);
+  auto rotMat10 = rotMat(1, 0);
+  auto rotMat11 = rotMat(1, 1);
+  auto rotMat12 = rotMat(1, 2);
+  auto rotMat20 = rotMat(2, 0);
+  auto rotMat21 = rotMat(2, 1);
+  auto rotMat22 = rotMat(2, 2);
+
+  auto mat00 = rMat_c(0, 0);
+  auto mat01 = rMat_c(0, 1);
+  auto mat02 = rMat_c(0, 2);
+  auto mat10 = rMat_c(1, 0);
+  auto mat11 = rMat_c(1, 1);
+  auto mat12 = rMat_c(1, 2);
+  auto mat20 = rMat_c(2, 0);
+  auto mat21 = rMat_c(2, 1);
+  auto mat22 = rMat_c(2, 2);
 
   // SIMD loop for full batches
+  #pragma omp parallel for
   for (size_t i = 0; i < num_full_batches * batch_size; i += batch_size) {
-    auto half_angs_v = xsimd::load_unaligned<float>(angs.col(0).data() + i) * 0.5;
+    auto half_angs_v = xsimd::load_unaligned(angs.data() + i) * 0.5;
+    auto angs1_v = xsimd::load_unaligned(angs.data() + vec_size + i);
+    auto angs2_v = xsimd::load_unaligned(angs.data() + 2 * vec_size + i);
+
     auto cosHalfAngs = xsimd::cos(half_angs_v);
-    auto sinHalfAngs = xsimd::sin(half_angs_v);
-    
-    auto angs1_v = xsimd::load_unaligned<float>(angs.col(1).data() + i);
-    auto cosAngs1 = xsimd::cos(angs1_v);
-    auto sinAngs1 = xsimd::sin(angs1_v);
-    
-    for (size_t j = 0; j < batch_size; ++j) {
-      gVec_l.row(i + j) << cosHalfAngs[j] * cosAngs1[j], cosHalfAngs[j] * sinAngs1[j], sinHalfAngs[j];
-    }
+    auto cosAngs2 = xsimd::cos(angs2_v);
+    auto sinAngs2 = xsimd::sin(angs2_v);
+
+    auto preMult_gVec_row_0 = cosHalfAngs * xsimd::cos(angs1_v);
+    auto preMult_gVec_row_1 = cosHalfAngs * xsimd::sin(angs1_v);
+    auto preMult_gVec_row_2 = xsimd::sin(half_angs_v);
+
+    auto gVec_row_0 = preMult_gVec_row_0 * rotMat00 +
+                      preMult_gVec_row_1 * rotMat01 +
+                      preMult_gVec_row_2 * rotMat02;
+    auto gVec_row_1 = preMult_gVec_row_0 * rotMat10 +
+                      preMult_gVec_row_1 * rotMat11 +
+                      preMult_gVec_row_2 * rotMat12;
+    auto gVec_row_2 = preMult_gVec_row_0 * rotMat20 +
+                      preMult_gVec_row_1 * rotMat21 +
+                      preMult_gVec_row_2 * rotMat22;
+
+    auto dot0 =
+        (mat00 * cosAngs2 + mat20 * sinAngs2) * gVec_row_0 +
+        (mat00 * schi * sinAngs2 + mat10 * cchi - mat20 * schi * cosAngs2) *
+            gVec_row_1 +
+        (-mat00 * cchi * sinAngs2 + mat10 * schi + mat20 * cchi * cosAngs2) *
+            gVec_row_2;
+    auto dot1 =
+        (mat01 * cosAngs2 + mat21 * sinAngs2) * gVec_row_0 +
+        (mat01 * schi * sinAngs2 + mat11 * cchi - mat21 * schi * cosAngs2) *
+            gVec_row_1 +
+        (-mat01 * cchi * sinAngs2 + mat11 * schi + mat21 * cchi * cosAngs2) *
+            gVec_row_2;
+    auto dot2 =
+        (mat02 * cosAngs2 + mat22 * sinAngs2) * gVec_row_0 +
+        (mat02 * schi * sinAngs2 + mat12 * cchi - mat22 * schi * cosAngs2) *
+            gVec_row_1 +
+        (-mat02 * cchi * sinAngs2 + mat12 * schi + mat22 * cchi * cosAngs2) *
+            gVec_row_2;
+
+    xsimd::store_unaligned(gVec_c.data() + i, dot0);
+    xsimd::store_unaligned(gVec_c.data() + vec_size + i, dot1);
+    xsimd::store_unaligned(gVec_c.data() + 2 * vec_size + i, dot2);
   }
 
   // Loop for remaining elements, if any
   for (size_t i = num_full_batches * batch_size; i < vec_size; ++i) {
-    float half_ang = angs(i, 0) * 0.5;
-    float cosHalfAng = std::cos(half_ang);
-    float sinHalfAng = std::sin(half_ang);
+    auto half_angs_v = *(angs.data() + i) * 0.5;
+    auto angs1_v = *(angs.data() + vec_size + i);
+    auto angs2_v = *(angs.data() + 2 * vec_size + i);
 
-    float ang1 = angs(i, 1);
-    float cosAng1 = std::cos(ang1);
-    float sinAng1 = std::sin(ang1);
+    auto cosHalfAngs = std::cos(half_angs_v);
+    auto cosAngs2 = std::cos(angs2_v);
+    auto sinAngs2 = std::sin(angs2_v);
 
-    gVec_l.row(i) << cosHalfAng * cosAng1, cosHalfAng * sinAng1, sinHalfAng;
-  }
+    auto preMult_gVec_row_0 = cosHalfAngs * xsimd::cos(angs1_v);
+    auto preMult_gVec_row_1 = cosHalfAngs * xsimd::sin(angs1_v);
+    auto preMult_gVec_row_2 = xsimd::sin(half_angs_v);
 
-  // Transform gVec_l to lab frame
-  gVec_l = (makeEtaFrameRotMat(bHat_l, eHat_l) * gVec_l.transpose()).eval();
+    auto gVec_row_0 = preMult_gVec_row_0 * rotMat00 +
+                      preMult_gVec_row_1 * rotMat01 +
+                      preMult_gVec_row_2 * rotMat02;
+    auto gVec_row_1 = preMult_gVec_row_0 * rotMat10 +
+                      preMult_gVec_row_1 * rotMat11 +
+                      preMult_gVec_row_2 * rotMat12;
+    auto gVec_row_2 = preMult_gVec_row_0 * rotMat20 +
+                      preMult_gVec_row_1 * rotMat21 +
+                      preMult_gVec_row_2 * rotMat22;
 
-  #pragma omp parallel for
-  for (int i = 0; i < angs.rows(); i++) {
-    float come = cos(angs(i, 2));
-    float some = sin(angs(i, 2));
+    auto dot0 =
+        (mat00 * cosAngs2 + mat20 * sinAngs2) * gVec_row_0 +
+        (mat00 * schi * sinAngs2 + mat10 * cchi - mat20 * schi * cosAngs2) *
+            gVec_row_1 +
+        (-mat00 * cchi * sinAngs2 + mat10 * schi + mat20 * cchi * cosAngs2) *
+            gVec_row_2;
+    auto dot1 =
+        (mat01 * cosAngs2 + mat21 * sinAngs2) * gVec_row_0 +
+        (mat01 * schi * sinAngs2 + mat11 * cchi - mat21 * schi * cosAngs2) *
+            gVec_row_1 +
+        (-mat01 * cchi * sinAngs2 + mat11 * schi + mat21 * cchi * cosAngs2) *
+            gVec_row_2;
+    auto dot2 =
+        (mat02 * cosAngs2 + mat22 * sinAngs2) * gVec_row_0 +
+        (mat02 * schi * sinAngs2 + mat12 * cchi - mat22 * schi * cosAngs2) *
+            gVec_row_1 +
+        (-mat02 * cchi * sinAngs2 + mat12 * schi + mat22 * cchi * cosAngs2) *
+            gVec_row_2;
 
-    gVec_c.row(i) << (rMat_c(0,0)*come + rMat_c(2,0)*some) * gVec_l(0, i) + (rMat_c(0,0)*some*schi + rMat_c(1,0)*cchi - rMat_c(2,0)*come*schi) * gVec_l(1, i) + (-rMat_c(0,0)*some*cchi + rMat_c(1,0)*schi + rMat_c(2,0)*come*cchi) * gVec_l(2, i),
-                     (rMat_c(0,1)*come + rMat_c(2,1)*some) * gVec_l(0, i) + (rMat_c(0,1)*some*schi + rMat_c(1,1)*cchi - rMat_c(2,1)*come*schi) * gVec_l(1, i) + (-rMat_c(0,1)*some*cchi + rMat_c(1,1)*schi + rMat_c(2,1)*come*cchi) * gVec_l(2, i),
-                     (rMat_c(0,2)*come + rMat_c(2,2)*some) * gVec_l(0, i) + (rMat_c(0,2)*some*schi + rMat_c(1,2)*cchi - rMat_c(2,2)*come*schi) * gVec_l(1, i) + (-rMat_c(0,2)*some*cchi + rMat_c(1,2)*schi + rMat_c(2,2)*come*cchi) * gVec_l(2, i);
+    *(gVec_c.data() + i) = dot0;
+    *(gVec_c.data() + vec_size + i) = dot1;
+    *(gVec_c.data() + 2 * vec_size + i) = dot2;
   }
 
   return gVec_c;
